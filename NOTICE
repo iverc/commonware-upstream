@@ -1,0 +1,14 @@
+iverc/commonware - a fork of commonwarexyz/monorepo
+Copyright (c) 2026 Commonware, Inc. All upstream code is dual MIT OR Apache-2.0.
+
+This fork modifies the following files. Upstream licensing and copyright are retained.
+
+  storage/src/qmdb/sync/engine.rs
+      Preserves eligible sync work across target updates, holds near-complete
+      targets until reached, and retries source-local pruning hints.
+
+  storage/src/qmdb/sync/source.rs
+      Adds the Response::Pruned wire variant and its codec.
+
+  glue/src/stateful/db/p2p/actor.rs
+      Accepts source-local pruning responses.

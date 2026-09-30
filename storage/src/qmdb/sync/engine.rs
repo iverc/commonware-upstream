@@ -15,7 +15,7 @@ use crate::{
 use commonware_codec::Encode;
 use commonware_cryptography::{Digest, Hasher};
 use commonware_macros::{boxed, select};
-use commonware_runtime::Supervisor as _;
+use commonware_runtime::{Clock as _, Supervisor as _};
 use commonware_utils::channel::{fallible::AsyncFallibleExt, mpsc};
 use futures::future::{Aborted, Either, pending};
 use mpsc::error::TryRecvError;
@@ -24,7 +24,11 @@ use std::{
     fmt::Debug,
     num::NonZeroU64,
     sync::Arc,
+    time::{Duration, SystemTime},
 };
+
+// Pruning is a source-local hint, not evidence that the target is unavailable.
+const PRUNED_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 /// Type alias for sync engine errors
 type Error<DB, S> =
@@ -42,6 +46,8 @@ pub(crate) enum NextStep<C, D> {
 /// Events that can occur during synchronization
 #[derive(Debug)]
 enum Event<F: Family, Op, D: Digest, E> {
+    /// Retry a target after a source reported pruning.
+    RetryPruned,
     /// A target update was received
     TargetUpdate(Target<F, D>),
     /// A batch of operations was received, or its request was aborted by a target update
@@ -74,7 +80,7 @@ where
     Op: Encode,
     H: Hasher,
 {
-    if response.proof().leaves != request.size() {
+    if response.is_pruned() || response.proof().leaves != request.size() {
         return false;
     }
 
@@ -112,8 +118,14 @@ async fn wait_for_event<F: Family, Op: Send, D: Digest, E: Send>(
     update_rx: &mut Option<mpsc::Receiver<Target<F, D>>>,
     finish_rx: &mut Option<mpsc::Receiver<()>>,
     outstanding_requests: &mut Requests<F, Op, D, E>,
+    context: &impl commonware_runtime::Clock,
+    retry_at: Option<SystemTime>,
 ) -> Option<Event<F, Op, D, E>> {
-    if outstanding_requests.len() == 0 && update_rx.is_none() && finish_rx.is_none() {
+    if outstanding_requests.len() == 0
+        && update_rx.is_none()
+        && finish_rx.is_none()
+        && retry_at.is_none()
+    {
         return None;
     }
 
@@ -125,9 +137,14 @@ async fn wait_for_event<F: Family, Op: Send, D: Digest, E: Send>(
         || Either::Right(pending()),
         |finish_rx| Either::Left(finish_rx.recv()),
     );
+    let retry_fut = retry_at.map_or_else(
+        || Either::Right(pending()),
+        |deadline| Either::Left(context.sleep_until(deadline)),
+    );
     let batch_result_fut = outstanding_requests.next_completed();
 
     select! {
+        () = retry_fut => Some(Event::RetryPruned),
         finish = finish_fut => finish.map_or_else(
             || Some(Event::FinishChannelClosed),
             |_| Some(Event::FinishRequested)
@@ -259,6 +276,11 @@ where
 
     /// Tracks whether the current target has already been reported as reached.
     reached_current_target_reported: bool,
+    /// Bounded pause after a source reports pruning; advancing targets bypass it.
+    pruned_retry_at: Option<SystemTime>,
+    /// Newest target update withheld while the journal is at the current target
+    /// and only pinned nodes are missing; applied on pruned responses or release.
+    stashed_target: Option<Target<DB::Family, DB::Digest>>,
 }
 
 #[cfg(test)]
@@ -333,6 +355,8 @@ where
             finish_rx: config.finish_rx,
             reached_target_tx: config.reached_target_tx,
             reached_current_target_reported: false,
+            pruned_retry_at: None,
+            stashed_target: None,
             metrics,
         };
         engine.schedule_requests();
@@ -349,6 +373,12 @@ where
                 let result: Result<_, S::Error> = async {
                     let (mut response, mut feedback) = source.serve(request).await?;
                     loop {
+                        if matches!(response, Response::Pruned { .. }) {
+                            if let Some(feedback) = feedback {
+                                feedback.accept();
+                            }
+                            return Ok(Some(response));
+                        }
                         if verify_response::<DB::Family, DB::Op, DB::Hasher>(
                             request, &root, &response,
                         ) {
@@ -375,6 +405,9 @@ where
 
     /// Schedule new fetch requests for operations in the sync range that we haven't yet fetched.
     fn schedule_requests(&mut self) {
+        if self.pruned_retry_at.is_some() {
+            return;
+        }
         let target_size = self.target.range.end();
 
         // Schedule a boundary request at the lower sync bound if pinned nodes are still
@@ -459,6 +492,7 @@ where
 
         self.target = new_target;
         self.reached_current_target_reported = false;
+        self.pruned_retry_at = None;
         Ok(self)
     }
 
@@ -616,23 +650,31 @@ where
             return Ok(());
         };
 
-        let response = fetch_result
-            .result
-            .map_err(SyncError::Source)?
-            .ok_or(SyncError::Engine(EngineError::InvalidResponse))?;
+        let response = fetch_result.result.map_err(SyncError::Source)?;
 
         let start_loc = request.start();
         match response {
-            Response::Operations { operations, .. } => {
+            Some(Response::Operations { operations, .. }) => {
+                self.pruned_retry_at = None;
                 self.store_operations(start_loc, operations);
             }
-            Response::Boundary {
+            Some(Response::Boundary {
                 op, pinned_nodes, ..
-            } => {
+            }) => {
                 // A tracked boundary request is at the current lower bound.
+                self.pruned_retry_at = None;
                 self.pinned_nodes = Some(pinned_nodes);
                 self.store_operations(start_loc, vec![op]);
             }
+            Some(Response::Pruned { .. }) => {
+                // A single source cannot establish that other peers lack this
+                // target. Bound retries without letting repeated hints postpone them.
+                self.pruned_retry_at
+                    .get_or_insert_with(|| self.context.current() + PRUNED_RETRY_DELAY);
+            }
+            // No candidate produced a usable response; the gap remains open and
+            // scheduling reissues the request.
+            None => {}
         }
 
         Ok(())
@@ -644,9 +686,28 @@ where
         event: Event<DB::Family, DB::Op, DB::Digest, S::Error>,
     ) -> Result<NextStep<Self, DB>, Error<DB, S>> {
         match event {
+            Event::RetryPruned => {
+                self.pruned_retry_at = None;
+                self.schedule_requests();
+                Ok(NextStep::Continue(self))
+            }
             Event::TargetUpdate(new_target) => {
                 // A non-advancing update is discarded.
                 if !new_target.advances(&self.target) {
+                    return Ok(NextStep::Continue(self));
+                }
+                // The journal is within reach of the target end: hold the target
+                // still so the remaining operations and a size-exact boundary
+                // response can land, and stash the update for later application.
+                // Chasing the live tip instead resets the verification size faster
+                // than one fetch round can complete.
+                let within_reach = self.journal.size() + 2 * self.fetch_batch_size.get()
+                    >= *self.target.range.end();
+                // Hold only until this target is reached: a parked engine must
+                // follow the next dispatch (tip or generation regroup), and every
+                // database settles on the newest target at the first update lull.
+                if !self.finish_requested && within_reach && !self.reached_current_target_reported {
+                    self.stashed_target = Some(new_target);
                     return Ok(NextStep::Continue(self));
                 }
                 // A same-root update that advances is impossible for an append-only log and
@@ -696,28 +757,25 @@ where
     #[boxed]
     pub(crate) async fn step(mut self) -> Result<NextStep<Self, DB>, Error<DB, S>> {
         self.drain_finish_requests()?;
+        if self.pruned_retry_at.is_some()
+            && let Some(stashed) = self.stashed_target.take()
+            && stashed.advances(&self.target)
+        {
+            // Force the reset: routing through handle_event would re-stash
+            // (the journal is still within reach) and spin without clearing
+            // the pruned-target pause.
+            let mut updated = self.reset_for_target_update(stashed).await?;
+            updated.record_progress();
+            updated.schedule_requests();
+            return Ok(NextStep::Continue(updated));
+        }
 
         // Check if sync is complete
         if self.is_ready_to_complete()? {
-            // Take a queued target update before completing at the old target, unless the
-            // caller already asked to finish. Updates that do not advance the target are
-            // discarded.
-            if !self.finish_requested {
-                while let Some(update_rx) = self.update_rx.as_mut() {
-                    match update_rx.try_recv() {
-                        Ok(new_target) => {
-                            if new_target.advances(&self.target) {
-                                return self.handle_event(Event::TargetUpdate(new_target)).await;
-                            }
-                        }
-                        Err(TryRecvError::Empty) => break,
-                        Err(TryRecvError::Disconnected) => {
-                            self.update_rx = None;
-                        }
-                    }
-                }
-            }
-
+            // Complete at the reached target rather than deferring to newer updates:
+            // the set coordinator regroups stragglers, and the application replays
+            // finalized blocks after the anchor, so converging slightly behind the
+            // tip is preferred over never converging under continuous updates.
             self.report_reached_target().await;
 
             if self.finish_rx.is_some() {
@@ -725,6 +783,8 @@ where
                     &mut self.update_rx,
                     &mut self.finish_rx,
                     &mut self.outstanding_requests,
+                    &self.context,
+                    self.pruned_retry_at,
                 )
                 .await
                 .ok_or(SyncError::Engine(EngineError::SyncStalled))?;
@@ -739,6 +799,8 @@ where
             &mut self.update_rx,
             &mut self.finish_rx,
             &mut self.outstanding_requests,
+            &self.context,
+            self.pruned_retry_at,
         )
         .await
         .ok_or(SyncError::Engine(EngineError::SyncStalled))?;
@@ -1214,14 +1276,115 @@ mod tests {
         });
     }
 
+    fn report_pruned(engine: &mut Engine<TestDb, TestSource>) {
+        engine.outstanding_requests = Requests::new();
+        let request = Request::Boundary {
+            size: engine.target.range.end(),
+            start: engine.target.range.start(),
+        };
+        let id = insert_pending_request(engine, request);
+        engine
+            .handle_fetch_result(IndexedFetchResult {
+                id,
+                result: Ok(Some(Response::Pruned {
+                    frontier: Location::new(1000),
+                })),
+            })
+            .unwrap();
+    }
+
     #[test]
-    fn step_takes_queued_update_before_completing() {
+    fn pruned_hints_retry_without_updates_and_do_not_busy_loop() {
+        deterministic::Runner::default().start(|context| async move {
+            let mut engine = Engine::new(test_engine_config(
+                context.child("engine"),
+                5,
+                Arc::new(AtomicUsize::new(0)),
+            ))
+            .await
+            .unwrap();
+            for _ in 0..3 {
+                let before = context.current();
+                report_pruned(&mut engine);
+                engine.schedule_requests();
+                assert_eq!(engine.outstanding_requests.len(), 0);
+                while engine.pruned_retry_at.is_some() {
+                    assert_eq!(engine.outstanding_requests.len(), 0);
+                    let NextStep::Continue(next) = engine.step().await.unwrap() else {
+                        panic!("pruning is not completion");
+                    };
+                    engine = next;
+                }
+                assert!(context.current().duration_since(before).unwrap() >= PRUNED_RETRY_DELAY);
+                assert_eq!(engine.outstanding_requests.len(), 1);
+                assert!(engine.pruned_retry_at.is_none());
+            }
+        });
+    }
+
+    #[test]
+    fn repeated_pruned_hints_do_not_extend_the_retry_deadline() {
+        deterministic::Runner::default().start(|context| async move {
+            let mut engine = Engine::new(test_engine_config(
+                context.child("engine"),
+                5,
+                Arc::new(AtomicUsize::new(0)),
+            ))
+            .await
+            .unwrap();
+            report_pruned(&mut engine);
+            let deadline = engine.pruned_retry_at;
+            context.sleep(PRUNED_RETRY_DELAY / 2).await;
+            report_pruned(&mut engine);
+            assert_eq!(engine.pruned_retry_at, deadline);
+        });
+    }
+
+    #[test]
+    fn advancing_target_bypasses_pruned_retry_delay() {
+        deterministic::Runner::default().start(|context| async move {
+            let mut engine = Engine::new(test_engine_config(
+                context.child("engine"),
+                9,
+                Arc::new(AtomicUsize::new(0)),
+            ))
+            .await
+            .unwrap();
+            report_pruned(&mut engine);
+            let deadline = engine.pruned_retry_at.unwrap();
+            let target = Target {
+                root: sha256::Digest::from([2; 32]),
+                range: non_empty_range!(Location::new(5), Location::new(12)),
+            };
+            let NextStep::Continue(engine) = engine
+                .handle_event(Event::TargetUpdate(target.clone()))
+                .await
+                .unwrap()
+            else {
+                panic!("update is not completion");
+            };
+            let NextStep::Continue(engine) = engine.step().await.unwrap() else {
+                panic!("retargeting is not completion");
+            };
+            assert_eq!(engine.target.root, target.root);
+            assert!(engine.pruned_retry_at.is_none());
+            assert!(context.current() < deadline);
+            assert!(engine.outstanding_requests.len() > 0);
+        });
+    }
+
+    #[test]
+    fn step_completes_at_the_reached_target_despite_queued_updates() {
         deterministic::Runner::default().start(|context| async move {
             let (update_tx, update_rx) = mpsc::channel(2);
             let mut config = test_engine_config(context, 10, Arc::new(AtomicUsize::new(0)));
+            // TestDb's root, so completion's final check passes.
+            config.target.root = sha256::Digest::from([0u8; 32]);
             config.update_rx = Some(update_rx);
-            // Queue a stale update and an advancing one. The stale one is discarded and
-            // the advancing one retargets the engine instead of completing.
+            // Queue a stale update and an advancing one. The engine completes at
+            // its reached target instead of chasing newer updates: the caller
+            // regroups stragglers and replays what follows the anchor, and
+            // deferring forever never converges under continuous updates.
             let stale = Target {
                 root: sha256::Digest::from([2u8; 32]),
                 range: non_empty_range!(Location::new(5), Location::new(10)),
@@ -1234,10 +1397,10 @@ mod tests {
             update_tx.send(advancing.clone()).await.unwrap();
 
             let engine = Engine::new(config).await.unwrap();
-            let NextStep::Continue(engine) = engine.step().await.unwrap() else {
-                panic!("engine should retarget instead of completing");
+            let NextStep::Complete(database) = engine.step().await.unwrap() else {
+                panic!("engine should complete at the reached target");
             };
-            assert_eq!(engine.target, advancing);
+            let _ = database;
         });
     }
 

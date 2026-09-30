@@ -248,13 +248,33 @@ pub enum Response<F: Family, Op, D: Digest> {
         /// Pinned nodes at the requested location.
         pinned_nodes: Vec<D>,
     },
+    /// The source pruned past the requested size and cannot answer.
+    ///
+    /// `frontier` is the source's claimed oldest retained position. This response
+    /// has no proof and says nothing about availability at other sources; it must
+    /// not permanently suppress retries or change the authenticated target.
+    Pruned {
+        /// Oldest journal position the source can still serve.
+        frontier: Location<F>,
+    },
 }
 
 impl<F: Family, Op, D: Digest> Response<F, Op, D> {
+    /// Whether this response reports the requested size as pruned.
+    pub const fn is_pruned(&self) -> bool {
+        matches!(self, Self::Pruned { .. })
+    }
+
     /// The proof authenticating this response.
-    pub const fn proof(&self) -> &Proof<F, D> {
+    ///
+    /// # Panics
+    ///
+    /// Panics for [`Self::Pruned`], which carries no proof; callers check
+    /// [`Self::is_pruned`] first.
+    pub fn proof(&self) -> &Proof<F, D> {
         match self {
             Self::Operations { proof, .. } | Self::Boundary { proof, .. } => proof,
+            Self::Pruned { .. } => unreachable!("pruned responses carry no proof"),
         }
     }
 }
@@ -274,6 +294,9 @@ impl<F: Family, Op: Clone, D: Digest> Clone for Response<F, Op, D> {
                 proof: proof.clone(),
                 op: op.clone(),
                 pinned_nodes: pinned_nodes.clone(),
+            },
+            Self::Pruned { frontier } => Self::Pruned {
+                frontier: *frontier,
             },
         }
     }
@@ -297,6 +320,10 @@ impl<F: Family, Op: std::fmt::Debug, D: Digest> std::fmt::Debug for Response<F, 
                 .field("op", op)
                 .field("pinned_nodes", pinned_nodes)
                 .finish(),
+            Self::Pruned { frontier } => f
+                .debug_struct("Pruned")
+                .field("frontier", frontier)
+                .finish(),
         }
     }
 }
@@ -319,6 +346,10 @@ impl<F: Family, Op: Write, D: Digest> Write for Response<F, Op, D> {
                 op.write(buf);
                 pinned_nodes.write(buf);
             }
+            Self::Pruned { frontier } => {
+                2u8.write(buf);
+                frontier.write(buf);
+            }
         }
     }
 }
@@ -334,6 +365,7 @@ impl<F: Family, Op: EncodeSize, D: Digest> EncodeSize for Response<F, Op, D> {
                 op,
                 pinned_nodes,
             } => proof.encode_size() + op.encode_size() + pinned_nodes.encode_size(),
+            Self::Pruned { frontier } => frontier.encode_size(),
         }
     }
 }
@@ -363,6 +395,9 @@ impl<F: Family, Op: Read, D: Digest> Read for Response<F, Op, D> {
                     pinned_nodes,
                 })
             }
+            2 => Ok(Self::Pruned {
+                frontier: Location::<F>::read(buf)?,
+            }),
             d => Err(CodecError::InvalidEnum(d)),
         }
     }
