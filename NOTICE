@@ -12,3 +12,6 @@ This fork modifies the following files. Upstream licensing and copyright are ret
 
   glue/src/stateful/db/p2p/actor.rs
       Accepts source-local pruning responses.
+
+  glue/src/dkg/reshare/application.rs
+      Retries pending epoch-info derivation during boundary verification.
