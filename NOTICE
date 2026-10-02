@@ -1,11 +1,12 @@
-iverc/commonware - a fork of commonwarexyz/monorepo
+iverc/commonware-upstream - Vera runtime branch of commonwarexyz/monorepo
 Copyright (c) 2026 Commonware, Inc. All upstream code is dual MIT OR Apache-2.0.
 
-This fork modifies the following files. Upstream licensing and copyright are retained.
+Based on upstream commit b07d043a815096c57c1da62cde20c9e065b8919c.
+Upstream licensing and copyright are retained. This fork modifies:
 
   storage/src/qmdb/sync/engine.rs
-      Preserves eligible sync work across target updates, holds near-complete
-      targets until reached, and retries source-local pruning hints.
+      Retries source-local pruning hints with a bounded delay and holds
+      near-complete targets until reached.
 
   storage/src/qmdb/sync/source.rs
       Adds the Response::Pruned wire variant and its codec.

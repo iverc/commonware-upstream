@@ -271,10 +271,10 @@ impl<F: Family, Op, D: Digest> Response<F, Op, D> {
     ///
     /// Panics for [`Self::Pruned`], which carries no proof; callers check
     /// [`Self::is_pruned`] first.
-    pub fn proof(&self) -> &Proof<F, D> {
+    pub const fn proof(&self) -> &Proof<F, D> {
         match self {
             Self::Operations { proof, .. } | Self::Boundary { proof, .. } => proof,
-            Self::Pruned { .. } => unreachable!("pruned responses carry no proof"),
+            Self::Pruned { .. } => panic!("pruned responses carry no proof"),
         }
     }
 }

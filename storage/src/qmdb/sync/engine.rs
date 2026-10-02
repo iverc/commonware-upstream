@@ -650,31 +650,31 @@ where
             return Ok(());
         };
 
-        let response = fetch_result.result.map_err(SyncError::Source)?;
+        let response = fetch_result
+            .result
+            .map_err(SyncError::Source)?
+            .ok_or(SyncError::Engine(EngineError::InvalidResponse))?;
 
         let start_loc = request.start();
         match response {
-            Some(Response::Operations { operations, .. }) => {
+            Response::Operations { operations, .. } => {
                 self.pruned_retry_at = None;
                 self.store_operations(start_loc, operations);
             }
-            Some(Response::Boundary {
+            Response::Boundary {
                 op, pinned_nodes, ..
-            }) => {
+            } => {
                 // A tracked boundary request is at the current lower bound.
                 self.pruned_retry_at = None;
                 self.pinned_nodes = Some(pinned_nodes);
                 self.store_operations(start_loc, vec![op]);
             }
-            Some(Response::Pruned { .. }) => {
+            Response::Pruned { .. } => {
                 // A single source cannot establish that other peers lack this
                 // target. Bound retries without letting repeated hints postpone them.
                 self.pruned_retry_at
                     .get_or_insert_with(|| self.context.current() + PRUNED_RETRY_DELAY);
             }
-            // No candidate produced a usable response; the gap remains open and
-            // scheduling reissues the request.
-            None => {}
         }
 
         Ok(())
