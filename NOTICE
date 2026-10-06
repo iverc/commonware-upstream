@@ -1,7 +1,7 @@
 iverc/commonware-upstream - Vera runtime branch of commonwarexyz/monorepo
 Copyright (c) 2026 Commonware, Inc. All upstream code is dual MIT OR Apache-2.0.
 
-Based on upstream commit b07d043a815096c57c1da62cde20c9e065b8919c.
+Based on upstream commit 39d04ee1057ee03046973391d26e7101e4a3ef41.
 Upstream licensing and copyright are retained. This fork modifies:
 
   storage/src/qmdb/sync/engine.rs

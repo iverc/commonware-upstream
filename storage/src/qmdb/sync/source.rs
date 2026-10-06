@@ -410,17 +410,19 @@ where
     D: for<'a> arbitrary::Arbitrary<'a>,
 {
     fn arbitrary(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Self> {
-        Ok(if u.arbitrary()? {
-            Self::Boundary {
+        Ok(match u.int_in_range(0..=2)? {
+            0 => Self::Operations {
+                proof: u.arbitrary()?,
+                operations: u.arbitrary()?,
+            },
+            1 => Self::Boundary {
                 proof: u.arbitrary()?,
                 op: u.arbitrary()?,
                 pinned_nodes: u.arbitrary()?,
-            }
-        } else {
-            Self::Operations {
-                proof: u.arbitrary()?,
-                operations: u.arbitrary()?,
-            }
+            },
+            _ => Self::Pruned {
+                frontier: u.arbitrary()?,
+            },
         })
     }
 }
