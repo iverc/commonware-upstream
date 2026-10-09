@@ -1,0 +1,66 @@
+name: Archive lookup retention
+
+on:
+  push:
+    branches: [iverc/prunable-archive-key-retention]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: archive-retention-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  focused:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4
+      - uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561
+        with:
+          toolchain: 1.98.0
+          components: clippy
+          targets: wasm32-unknown-unknown
+      - uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
+        with:
+          tool: just@1.43.0,cargo-nextest@0.9.133
+      - name: Validate cleanup and collision handling
+        run: >-
+          just test --locked -p commonware-storage
+          -E 'test(test_prune_cleans_lookup_index) | test(test_prune_preserves_colliding_backfill) |
+          test(test_hash_index_retain_all) | test(test_archive_prune_keys) | test(test_put_multi_prune)'
+      - name: Confirm the regression detects the previous pruning behavior
+        shell: bash
+        run: |
+          trap 'git restore -- storage/src/archive/prunable/storage.rs' EXIT
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('storage/src/archive/prunable/storage.rs')
+          source = path.read_text()
+          call = '        self.keys.retain_all(|index| *index >= min);\n'
+          assert source.count(call) == 1
+          path.write_text(source.replace(call, ''))
+          PY
+          set +e
+          just test --locked -p commonware-storage test_prune_cleans_lookup_index > "$RUNNER_TEMP/archive-baseline.log" 2>&1
+          status=$?
+          set -e
+          python3 - "$status" "$RUNNER_TEMP/archive-baseline.log" <<'PY'
+          from pathlib import Path
+          import sys
+          output = Path(sys.argv[2]).read_text()
+          expected = 'assertion failed: has_metric_value(&buffer, "index_items", 16)'
+          assert int(sys.argv[1]) != 0 and expected in output
+          print('Previous pruning behavior fails the bounded lookup-index assertion.')
+          PY
+      - name: Check storage lints
+        run: just clippy -p commonware-storage
+      - name: Check storage without std
+        run: cargo check --locked -p commonware-storage --no-default-features
+      - name: Check storage on WASM
+        run: cargo check --locked -p commonware-storage --target wasm32-unknown-unknown
