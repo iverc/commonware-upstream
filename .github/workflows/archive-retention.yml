@@ -44,7 +44,7 @@ jobs:
           source = path.read_text()
           call = '        self.keys.retain_all(|index| *index >= min);\n'
           assert source.count(call) == 1
-          path.write_text(source.replace(call, ''))
+          path.write_text(source.replace(call, '        self.keys.retain_all(|_| true);\n'))
           PY
           set +e
           just test --locked -p commonware-storage test_prune_cleans_lookup_index > "$RUNNER_TEMP/archive-baseline.log" 2>&1
@@ -52,9 +52,11 @@ jobs:
           set -e
           python3 - "$status" "$RUNNER_TEMP/archive-baseline.log" <<'PY'
           from pathlib import Path
-          import sys
-          output = Path(sys.argv[2]).read_text()
+          import json, re, sys
+          output = re.sub(r'\x1b\[[0-9;]*m', '', Path(sys.argv[2]).read_text())
           expected = 'assertion failed: has_metric_value(&buffer, "index_items", 16)'
+          print(json.dumps({'status': int(sys.argv[1]), 'expected_failure': int(expected in output),
+                            'compiler_errors': len(re.findall(r'error(?:\[|:)', output))}))
           assert int(sys.argv[1]) != 0 and expected in output
           print('Previous pruning behavior fails the bounded lookup-index assertion.')
           PY
