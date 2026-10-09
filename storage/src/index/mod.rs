@@ -498,6 +498,45 @@ mod tests {
     }
 
     #[test_traced]
+    fn test_hash_index_retain_all() {
+        deterministic::Runner::default().start(|context| async move {
+            let mut index = new_unordered(context);
+            for (key, value) in [
+                (b"aa0", 10),
+                (b"aa1", 1),
+                (b"bb0", 1),
+                (b"bb1", 20),
+                (b"cc0", 2),
+                (b"cc1", 3),
+                (b"dd0", 30),
+                (b"ee0", 4),
+            ] {
+                index.insert(key, value);
+            }
+            let mut visited = Vec::new();
+            index.retain_all(|value| {
+                visited.push(*value);
+                *value >= 10
+            });
+            visited.sort_unstable();
+            assert_eq!(visited, vec![1, 1, 2, 3, 4, 10, 20, 30]);
+            assert_values(&index, b"aa", &[10]);
+            assert_values(&index, b"bb", &[20]);
+            assert_values(&index, b"cc", &[]);
+            assert_values(&index, b"dd", &[30]);
+            assert_values(&index, b"ee", &[]);
+            assert_eq!((index.keys(), index.items(), index.pruned()), (3, 3, 5));
+            index.retain_all(|_| true);
+            assert_eq!((index.keys(), index.items(), index.pruned()), (3, 3, 5));
+            index.retain_all(|_| false);
+            assert_eq!((index.keys(), index.items(), index.pruned()), (0, 0, 8));
+            index.insert(b"aa0", 40);
+            assert_values(&index, b"aa", &[40]);
+            assert_eq!((index.keys(), index.items(), index.pruned()), (1, 1, 8));
+        });
+    }
+
+    #[test_traced]
     fn test_hash_index_basic() {
         let runner = deterministic::Runner::default();
         runner.start(|context| async move {
