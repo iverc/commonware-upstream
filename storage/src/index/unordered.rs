@@ -106,6 +106,38 @@ impl<T: Translator, V: Send + Sync> Index<T, V> {
         self.overflow = other.overflow;
     }
 
+    /// Retain values across all translated keys, visiting each value once in unspecified order.
+    /// Scans the inline and overflow map capacities without allocating a replacement index.
+    #[commonware_macros::stability(ALPHA)]
+    pub(crate) fn retain_all(&mut self, mut should_retain: impl FnMut(&V) -> bool) {
+        let mut removed = 0;
+        self.overflow.retain(|_, values| {
+            let previous = values.len();
+            values.retain(&mut should_retain);
+            removed += previous - values.len();
+            !values.is_empty()
+        });
+
+        let previous_keys = self.map.len();
+        self.map.retain(|key, value| {
+            if should_retain(value) {
+                return true;
+            }
+            removed += 1;
+            let Some(values) = self.overflow.get_mut(key) else {
+                return false;
+            };
+            *value = values.pop().expect("retained overflow is nonempty");
+            if values.is_empty() {
+                self.overflow.remove(key);
+            }
+            true
+        });
+        self.keys.dec_by((previous_keys - self.map.len()) as i64);
+        self.items.dec_by(removed as i64);
+        self.pruned.inc_by(removed as u64);
+    }
+
     /// Visit every value held by the index (inline and overflow), in unspecified order.
     #[commonware_macros::stability(ALPHA)]
     pub(crate) fn for_each_value(&self, mut f: impl FnMut(&V)) {

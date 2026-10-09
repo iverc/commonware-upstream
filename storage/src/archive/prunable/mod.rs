@@ -2327,6 +2327,81 @@ mod tests {
     }
 
     #[test_traced]
+    fn test_prune_cleans_lookup_index() {
+        deterministic::Runner::default().start(|context| async move {
+            let cfg = test_config(&context, "test", NZU64!(4));
+            let mut archive = Archive::init(context.child("storage"), cfg).await.unwrap();
+            for batch in 0..32 {
+                let first = batch * 16;
+                for index in first..first + 16 {
+                    archive = archive
+                        .put(index, test_key(&format!("{index:04x}")), &(index as i32))
+                        .await
+                        .unwrap();
+                }
+                archive = archive.prune(first).await.unwrap();
+                let buffer = context.encode();
+                assert!(has_metric_value(&buffer, "index_items", 16));
+                assert!(has_metric_value(&buffer, "index_keys", 16));
+                assert!(has_metric_value(&buffer, "items_tracked", 16));
+                assert_eq!(
+                    archive
+                        .get(Identifier::Key(&test_key(&format!("{first:04x}"))))
+                        .await
+                        .unwrap(),
+                    Some(first as i32)
+                );
+                if first > 0 {
+                    assert_eq!(
+                        archive
+                            .get(Identifier::Key(&test_key(&format!("{:04x}", first - 1))))
+                            .await
+                            .unwrap(),
+                        None
+                    );
+                }
+                archive = archive.prune(first + 1).await.unwrap();
+                assert!(has_metric_value(&context.encode(), "index_items", 16));
+            }
+            archive = archive.prune(512).await.unwrap();
+            assert!(has_metric_value(&context.encode(), "index_items", 0));
+            assert!(has_metric_value(&context.encode(), "index_keys", 0));
+            archive.sync().await.unwrap();
+        });
+    }
+
+    #[test_traced]
+    fn test_prune_preserves_colliding_backfill() {
+        deterministic::Runner::default().start(|context| async move {
+            let cfg = test_config(&context, "test", NZU64!(4));
+            let mut archive = Archive::init(context.child("storage"), cfg).await.unwrap();
+            archive = archive.put(1, test_key("head-pruned"), &10).await.unwrap();
+            archive = archive.put(5, test_key("head-kept"), &50).await.unwrap();
+            archive = archive
+                .put_multi(5, test_key("tail-kept"), &51)
+                .await
+                .unwrap();
+            archive = archive.put(2, test_key("tail-pruned"), &20).await.unwrap();
+            archive = archive.prune(7).await.unwrap();
+            assert_eq!(archive.get_all(5).await.unwrap(), Some(vec![50, 51]));
+            for (key, expected) in [
+                ("head-kept", Some(50)),
+                ("tail-kept", Some(51)),
+                ("head-pruned", None),
+                ("tail-pruned", None),
+            ] {
+                assert_eq!(
+                    archive.get(Identifier::Key(&test_key(key))).await.unwrap(),
+                    expected
+                );
+            }
+            assert!(has_metric_value(&context.encode(), "index_items", 2));
+            assert!(has_metric_value(&context.encode(), "index_keys", 2));
+            archive.sync().await.unwrap();
+        });
+    }
+
+    #[test_traced]
     fn test_archive_prune_keys() {
         // Initialize the deterministic context
         let executor = deterministic::Runner::default();
@@ -2389,7 +2464,7 @@ mod tests {
             let buffer = context.encode();
             assert!(has_metric_value(&buffer, "items_tracked", 3));
             assert!(has_metric_value(&buffer, "indices_pruned_total", 2));
-            assert!(has_metric_value(&buffer, "pruned_total", 0)); // no lazy cleanup yet
+            assert!(has_metric_value(&buffer, "pruned_total", 2));
 
             // Try to prune older section
             archive = archive.prune(2).await.expect("Failed to prune");
@@ -2397,7 +2472,7 @@ mod tests {
             // Try to prune current section again
             archive = archive.prune(3).await.expect("Failed to prune");
 
-            // Trigger lazy removal of keys
+            // Reusing a retired key must not prune it a second time
             archive = archive
                 .put(6, test_key("key2-blfh"), &5)
                 .await
@@ -2405,9 +2480,9 @@ mod tests {
 
             // Check metrics
             let buffer = context.encode();
-            assert!(has_metric_value(&buffer, "items_tracked", 4)); // lazily remove one, add one
+            assert!(has_metric_value(&buffer, "items_tracked", 4));
             assert!(has_metric_value(&buffer, "indices_pruned_total", 2));
-            assert!(has_metric_value(&buffer, "pruned_total", 1));
+            assert!(has_metric_value(&buffer, "pruned_total", 2));
 
             // A put below the prune floor is satisfied without storing
             let archive = archive
@@ -2587,7 +2662,7 @@ mod tests {
                 num_keys - removed
             ));
             assert!(has_metric_value(&buffer, "indices_pruned_total", removed));
-            assert!(has_metric_value(&buffer, "pruned_total", 0)); // have not lazily removed keys yet
+            assert!(has_metric_value(&buffer, "pruned_total", removed));
 
             context.auditor().state()
         })

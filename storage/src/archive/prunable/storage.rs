@@ -430,6 +430,9 @@ impl<T: Translator, E: Context, K: Array, V: CodecShared> Inner<T, E, K, V> {
             self.indices_pruned.inc();
         }
 
+        // Retire lookup entries even when their translated key is never inserted again.
+        self.keys.retain_all(|index| *index >= min);
+
         // Remove pruned indices from the retained range view.
         if min > 0 {
             self.intervals.remove(0, min - 1);
