@@ -36,6 +36,12 @@ def main():
     print(json.dumps({'status': result.returncode, 'expected_stall': observed,
                       'compiler_errors': errors}))
     if result.returncode == 0 or not observed or errors:
+        lines = output.splitlines()
+        for index, line in enumerate(lines):
+            if re.search(r'error\[E\d+\]', line):
+                print('\n'.join(lines[max(0, index - 1):index + 12]))
+        if not errors:
+            print('\n'.join(lines[-40:]))
         raise RuntimeError('baseline did not fail at the queued-tip deadline')
 
 
