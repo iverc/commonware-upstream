@@ -777,6 +777,7 @@ where
             // finalized blocks after the anchor, so converging slightly behind the
             // tip is preferred over never converging under continuous updates.
             self.report_reached_target().await;
+            self.drain_finish_requests()?;
 
             if self.finish_rx.is_some() {
                 // A coordinator may already have assigned this newer target.
@@ -1460,6 +1461,38 @@ mod tests {
                 ));
             });
         }
+    }
+
+    #[test]
+    fn finish_received_during_progress_report_precedes_stashed_update() {
+        deterministic::Runner::default().start(|context| async move {
+            let (finish_tx, finish_rx) = mpsc::channel(1);
+            let (reached_tx, mut reached_rx) = mpsc::channel(1);
+            let mut config = test_engine_config(context, 10, Arc::new(AtomicUsize::new(0)));
+            config.target.root = sha256::Digest::from([0; 32]);
+            let original = config.target.clone();
+            reached_tx.send(original.clone()).await.unwrap();
+            config.finish_rx = Some(finish_rx);
+            config.reached_target_tx = Some(reached_tx);
+            let engine = Engine::new(config).await.unwrap();
+            let target = Target {
+                root: sha256::Digest::from([2; 32]),
+                range: non_empty_range!(Location::new(5), Location::new(12)),
+            };
+            let NextStep::Continue(engine) = engine
+                .handle_event(Event::TargetUpdate(target))
+                .await
+                .unwrap()
+            else {
+                panic!("an update must not complete sync");
+            };
+            let finish = async {
+                assert_eq!(reached_rx.recv().await.unwrap(), original);
+                finish_tx.send(()).await.unwrap();
+            };
+            let (result, ()) = futures::join!(engine.step(), finish);
+            assert!(matches!(result.unwrap(), NextStep::Complete(_)));
+        });
     }
 
     #[test]

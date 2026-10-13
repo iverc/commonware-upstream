@@ -16,9 +16,13 @@ def main():
     )
     if original.count(release) != 1:
         raise RuntimeError('expected one coordinated target-release block')
+    report = b'            self.report_reached_target().await;\n'
+    drain = report + b'            self.drain_finish_requests()?;\n'
+    if original.count(drain) != 1:
+        raise RuntimeError('expected one post-report finish check')
     log = Path(os.environ['RUNNER_TEMP']) / 'queued-tip-baseline.log'
     try:
-        source.write_bytes(original.replace(release, b''))
+        source.write_bytes(original.replace(release, b'').replace(drain, report))
         with log.open('wb') as output:
             result = subprocess.run(
                 ['just', 'test', '--locked', '-p', 'commonware-storage', '--no-capture',
