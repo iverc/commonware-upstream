@@ -1385,7 +1385,7 @@ mod tests {
                 let (_finish_tx, finish_rx) = mpsc::channel(1);
                 let (reached_tx, mut reached_rx) = mpsc::channel(1);
                 let mut config =
-                    test_engine_config(context.clone(), 10, Arc::new(AtomicUsize::new(0)));
+                    test_engine_config(context.child("engine"), 10, Arc::new(AtomicUsize::new(0)));
                 config.finish_rx = Some(finish_rx);
                 config.reached_target_tx = Some(reached_tx);
                 let original = config.target.clone();
@@ -1418,7 +1418,10 @@ mod tests {
                     panic!("the coordinator has not requested completion");
                 };
                 assert_eq!(reached_rx.try_recv().unwrap(), original);
-                assert_eq!(engine.target, latest);
+                assert_eq!(
+                    engine.target, latest,
+                    "reached target kept a queued tip parked"
+                );
                 assert!(engine.stashed_target.is_none());
                 assert!(!engine.reached_current_target_reported);
             });

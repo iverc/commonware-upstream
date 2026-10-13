@@ -42,7 +42,7 @@ def main():
                 print('\n'.join(lines[max(0, index - 1):index + 12]))
         if not errors:
             print('\n'.join(lines[-40:]))
-        raise RuntimeError('baseline did not fail at the queued-tip deadline')
+        raise RuntimeError('baseline did not fail at the queued-target release assertion')
 
 
 if __name__ == '__main__':
