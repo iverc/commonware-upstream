@@ -278,8 +278,8 @@ where
     reached_current_target_reported: bool,
     /// Bounded pause after a source reports pruning; advancing targets bypass it.
     pruned_retry_at: Option<SystemTime>,
-    /// Newest target update withheld while the journal is at the current target
-    /// and only pinned nodes are missing; applied on pruned responses or release.
+    /// Newest target held while the current target is within fetch reach.
+    /// Coordinated sync releases it after reporting progress, or earlier on pruning.
     stashed_target: Option<Target<DB::Family, DB::Digest>>,
 }
 
@@ -779,6 +779,11 @@ where
             self.report_reached_target().await;
 
             if self.finish_rx.is_some() {
+                // A coordinator may already have assigned this newer target.
+                // Release it after reporting progress without requiring another tip.
+                if let Some(stashed) = self.stashed_target.take() {
+                    return self.handle_event(Event::TargetUpdate(stashed)).await;
+                }
                 let event = wait_for_event(
                     &mut self.update_rx,
                     &mut self.finish_rx,
@@ -1370,6 +1375,112 @@ mod tests {
             assert!(engine.pruned_retry_at.is_none());
             assert!(context.current() < deadline);
             assert!(engine.outstanding_requests.len() > 0);
+        });
+    }
+
+    #[test]
+    fn reached_coordinated_target_releases_stashed_update_without_another_tip() {
+        for sizes in [&[12][..], &[12, 14][..]] {
+            deterministic::Runner::default().start(|context| async move {
+                let (_finish_tx, finish_rx) = mpsc::channel(1);
+                let (reached_tx, mut reached_rx) = mpsc::channel(1);
+                let mut config =
+                    test_engine_config(context.clone(), 10, Arc::new(AtomicUsize::new(0)));
+                config.finish_rx = Some(finish_rx);
+                config.reached_target_tx = Some(reached_tx);
+                let original = config.target.clone();
+                let mut engine = Engine::new(config).await.unwrap();
+                let mut latest = original.clone();
+                for &size in sizes {
+                    latest = Target {
+                        root: sha256::Digest::from([u8::try_from(size).unwrap(); 32]),
+                        range: non_empty_range!(Location::new(5), Location::new(size)),
+                    };
+                    let NextStep::Continue(updated) = engine
+                        .handle_event(Event::TargetUpdate(latest.clone()))
+                        .await
+                        .unwrap()
+                    else {
+                        panic!("an update must not complete sync");
+                    };
+                    engine = updated;
+                }
+                assert_eq!(engine.target, original);
+                assert_eq!(engine.stashed_target.as_ref(), Some(&latest));
+
+                let result = select! {
+                    result = engine.step() => result,
+                    _ = context.sleep(Duration::from_secs(1)) => {
+                        panic!("reached target kept a queued tip parked");
+                    },
+                };
+                let NextStep::Continue(engine) = result.unwrap() else {
+                    panic!("the coordinator has not requested completion");
+                };
+                assert_eq!(reached_rx.try_recv().unwrap(), original);
+                assert_eq!(engine.target, latest);
+                assert!(engine.stashed_target.is_none());
+                assert!(!engine.reached_current_target_reported);
+            });
+        }
+    }
+
+    #[test]
+    fn completion_precedes_stashed_update_without_coordinator_or_after_finish() {
+        for coordinated in [false, true] {
+            deterministic::Runner::default().start(|context| async move {
+                let (finish_tx, finish_rx) = mpsc::channel(1);
+                let mut config = test_engine_config(context, 10, Arc::new(AtomicUsize::new(0)));
+                config.target.root = sha256::Digest::from([0; 32]);
+                if coordinated {
+                    config.finish_rx = Some(finish_rx);
+                }
+                let engine = Engine::new(config).await.unwrap();
+                let target = Target {
+                    root: sha256::Digest::from([2; 32]),
+                    range: non_empty_range!(Location::new(5), Location::new(12)),
+                };
+                let NextStep::Continue(engine) = engine
+                    .handle_event(Event::TargetUpdate(target.clone()))
+                    .await
+                    .unwrap()
+                else {
+                    panic!("an update must not complete sync");
+                };
+                assert_eq!(engine.stashed_target.as_ref(), Some(&target));
+                if coordinated {
+                    finish_tx.send(()).await.unwrap();
+                }
+                assert!(matches!(
+                    engine.step().await.unwrap(),
+                    NextStep::Complete(_)
+                ));
+            });
+        }
+    }
+
+    #[test]
+    fn releasing_stashed_update_rejects_an_unchanged_root() {
+        deterministic::Runner::default().start(|context| async move {
+            let (_finish_tx, finish_rx) = mpsc::channel(1);
+            let mut config = test_engine_config(context, 10, Arc::new(AtomicUsize::new(0)));
+            config.finish_rx = Some(finish_rx);
+            let target = Target {
+                root: config.target.root,
+                range: non_empty_range!(Location::new(5), Location::new(12)),
+            };
+            let engine = Engine::new(config).await.unwrap();
+            let NextStep::Continue(engine) = engine
+                .handle_event(Event::TargetUpdate(target))
+                .await
+                .unwrap()
+            else {
+                panic!("an update must not complete sync");
+            };
+            assert!(matches!(
+                engine.step().await,
+                Err(SyncError::Engine(EngineError::SyncTargetRootUnchanged))
+            ));
         });
     }
 
