@@ -1,0 +1,17 @@
+Vera integration branch of commonwarexyz/monorepo
+Copyright (c) 2026 Commonware, Inc. Upstream licensing is retained.
+
+Based on upstream commit 38dfb1a22089d5b876be78f21a933970f66ef5cf.
+The remaining changes are:
+
+  storage/src/archive/prunable/{mod,storage}.rs
+      Retire lookup references using only the index sections being pruned.
+
+  storage/src/qmdb/sync/engine.rs
+      Report reached targets before queued updates and observe finish requests
+      received during the progress report.
+
+  glue/src/dkg/reshare/application.rs
+      Retry transient pending epoch information during boundary verification.
+
+These patches do not change upstream request, response or storage encodings.
