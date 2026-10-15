@@ -34,8 +34,11 @@ jobs:
       - uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
         with:
           tool: cargo-nextest@0.9.133
-      - name: Check archive assertions and compact sync ordering
-        run: >-
-          cargo nextest run --locked -p commonware-storage -p commonware-glue
-          --ignore-default-filter
-          -E '(test(archive::prunable::tests::) & (test(test_archive_prune_keys) | test(test_determinism) | test(test_prune_cleans_lookup_index))) | test(state_sync_drains_queued_target_before_reporting_reached)'
+      - name: Reproduce archive and coordinator regressions
+        run: python3 .github/scripts/verify-review-regressions.py
+      - name: Preserve regression output
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: review-regression-baseline
+          path: review-regression-*.log

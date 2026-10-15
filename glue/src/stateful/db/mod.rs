@@ -4868,4 +4868,90 @@ mod tests {
             assert_eq!(&*log.lock(), &["db1", "db2"]);
         });
     }
+
+    struct ProgressGates {
+        start: oneshot::Receiver<()>,
+        first_update_consumed: oneshot::Sender<()>,
+        resume: oneshot::Receiver<()>,
+    }
+
+    impl<E: Send> StateSyncDb<E, ProgressGates> for SlowSyncDb {
+        type SyncError = Infallible;
+
+        async fn sync_db(
+            _context: E,
+            _config: Self::Config,
+            gates: ProgressGates,
+            target: Self::SyncTarget,
+            mut updates: mpsc::Receiver<Self::SyncTarget>,
+            finish: Option<mpsc::Receiver<()>>,
+            reached: Option<mpsc::Sender<Self::SyncTarget>>,
+            _sync_config: SyncEngineConfig,
+        ) -> Result<Self, Self::SyncError> {
+            let reached = reached.unwrap();
+            let mut finish = finish.unwrap();
+            gates.start.await.unwrap();
+            reached.send(target).await.unwrap();
+            let mut final_target = updates.recv().await.unwrap();
+            assert_eq!(final_target, 1);
+            gates.first_update_consumed.send(()).unwrap();
+            gates.resume.await.unwrap();
+            loop {
+                reached.send(final_target).await.unwrap();
+                select! {
+                    signal = finish.recv() => {
+                        assert_eq!(signal, Some(()));
+                        return Ok(Self { final_target });
+                    },
+                    update = updates.recv() => final_target = update.unwrap(),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn single_state_sync_drains_progress_while_target_send_is_blocked() {
+        deterministic::Runner::timed(Duration::from_secs(5)).start(|context| async move {
+            let (mut tips, tip_rx) = ring::channel(NZUsize!(4));
+            let (start, start_rx) = oneshot::channel();
+            let (consumed, consumed_rx) = oneshot::channel();
+            let (resume, resume_rx) = oneshot::channel();
+            let sync = <Shared<SlowSyncDb> as StateSyncSet<_, _, sha256::Digest>>::sync(
+                context.clone(), (),
+                ProgressGates { start: start_rx, first_update_consumed: consumed, resume: resume_rx },
+                anchor(0), 0, tip_rx,
+                SyncEngineConfig {
+                    fetch_batch_size: NZU64!(1), apply_batch_size: NZU64!(1),
+                    max_outstanding_requests: NZUsize!(1), update_channel_size: NZUsize!(1),
+                },
+            );
+            pin_mut!(sync);
+            // Fill the target queue, then block a second target send while the database waits.
+            for target in [1, 2] {
+                let (update, mut observed) = TipUpdate::with_observation(anchor(target), target);
+                tips.send(update).await.unwrap();
+                assert!(sync.as_mut().now_or_never().is_none());
+                assert_eq!((&mut observed).now_or_never(), Some(Ok(())));
+            }
+            let (update, observed) = TipUpdate::with_observation(anchor(3), 3);
+            tips.send(update).await.unwrap();
+            start.send(()).unwrap();
+            select! {
+                _ = sync.as_mut() => panic!("sync finished before consuming the first target"),
+                consumed = consumed_rx => consumed.unwrap(),
+            };
+            select! {
+                _ = sync.as_mut() => panic!("sync finished before recording the newest target"),
+                observed = observed => observed.unwrap(),
+            };
+            // The next reached notification must unblock even while the target queue is full.
+            resume.send(()).unwrap();
+            let (database, converged) = select! {
+                result = sync => result.unwrap(),
+                _ = context.sleep(Duration::from_secs(1)) => panic!("single-database sync deadlocked on target/progress backpressure"),
+            };
+            assert_eq!(converged, anchor(3));
+            assert_eq!(database.read().await.final_target, 3);
+        });
+    }
 }
