@@ -1276,7 +1276,7 @@ mod tests {
                 commonware_macros::select! {
                     verified = app.verify(
                         (context.child("app"), block_context(&parent, 1)),
-                        ancestry::from_iter([tip, parent]),
+                        ancestry::from_iter([tip, Digested::precomputed(parent.clone(), parent.digest())]),
                     ) => assert_eq!(verified, matches),
                     _ = context.sleep(Duration::from_secs(1)) => {
                         panic!("verification remained stuck after epoch info became available");
