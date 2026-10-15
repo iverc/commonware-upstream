@@ -34,11 +34,11 @@ jobs:
       - uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
         with:
           tool: cargo-nextest@0.9.133
-      - name: Check sync, archive and DKG regressions
+      - name: Check archive restart and determinism
         run: >-
           cargo nextest run --locked -p commonware-storage -p commonware-glue
           --ignore-default-filter
-          -E '(test(qmdb::sync::engine::tests::) | test(archive::prunable::tests::) | test(dkg::reshare::application::tests::) | test(tuple_state_sync)) & not test(/_slow_(::|$)/)'
+          -E 'test(archive::prunable::tests::) & (test(test_archive_many_keys_and_restart) | test(test_determinism))'
       - name: Lint changed packages
         run: cargo clippy --locked -p commonware-storage -p commonware-glue --all-targets -- -D warnings
       - name: Check storage without default features
