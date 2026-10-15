@@ -4917,7 +4917,7 @@ mod tests {
             let (consumed, consumed_rx) = oneshot::channel();
             let (resume, resume_rx) = oneshot::channel();
             let sync = <Shared<SlowSyncDb> as StateSyncSet<_, _, sha256::Digest>>::sync(
-                context.clone(), (),
+                context.child("sync"), (),
                 ProgressGates { start: start_rx, first_update_consumed: consumed, resume: resume_rx },
                 anchor(0), 0, tip_rx,
                 SyncEngineConfig {
