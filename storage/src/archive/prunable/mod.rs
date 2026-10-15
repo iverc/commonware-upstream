@@ -2892,4 +2892,48 @@ mod tests {
             assert_eq!(archive.get_all(2).await.expect("Failed to get data"), None);
         });
     }
+
+    #[test_traced]
+    fn test_prune_cleans_lookup_index() {
+        deterministic::Runner::default().start(|context| async move {
+            let cfg = test_config(&context, "test", NZU64!(4));
+            let mut archive = Archive::init(context.child("storage"), cfg).await.unwrap();
+            for batch in 0..32 {
+                let first = batch * 16;
+                for index in first..first + 16 {
+                    archive = archive
+                        .put(index, test_key(&format!("{index:04x}")), &(index as i32))
+                        .await
+                        .unwrap();
+                }
+                archive = archive.prune(first).await.unwrap();
+                let buffer = context.encode();
+                assert!(has_metric_value(&buffer, "index_items", 16));
+                assert!(has_metric_value(&buffer, "index_keys", 16));
+                assert!(has_metric_value(&buffer, "items_tracked", 16));
+                assert_eq!(
+                    archive
+                        .get(Identifier::Key(&test_key(&format!("{first:04x}"))))
+                        .await
+                        .unwrap(),
+                    Some(first as i32)
+                );
+                if first > 0 {
+                    assert_eq!(
+                        archive
+                            .get(Identifier::Key(&test_key(&format!("{:04x}", first - 1))))
+                            .await
+                            .unwrap(),
+                        None
+                    );
+                }
+                archive = archive.prune(first + 1).await.unwrap();
+                assert!(has_metric_value(&context.encode(), "index_items", 16));
+            }
+            archive = archive.prune(512).await.unwrap();
+            assert!(has_metric_value(&context.encode(), "index_items", 0));
+            assert!(has_metric_value(&context.encode(), "index_keys", 0));
+            archive.sync().await.unwrap();
+        });
+    }
 }

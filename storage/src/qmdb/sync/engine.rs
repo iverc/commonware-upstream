@@ -1524,4 +1524,33 @@ pub(crate) mod tests {
             assert!(matches!(requests.next_completed().await, Err(Aborted)));
         });
     }
+
+    #[test]
+    fn reports_reached_target_before_queued_update() {
+        deterministic::Runner::default().start(|context| async move {
+            let (update_tx, update_rx) = mpsc::channel(1);
+            let (_finish_tx, finish_rx) = mpsc::channel(1);
+            let (reached_tx, mut reached_rx) = mpsc::channel(1);
+            let mut config = test_engine_config(context, 10, Arc::new(AtomicUsize::new(0)));
+            config.update_rx = Some(update_rx);
+            config.finish_rx = Some(finish_rx);
+            config.reached_target_tx = Some(reached_tx);
+            let original = config.target.clone();
+            let next = Target {
+                root: sha256::Digest::from([2; 32]),
+                range: non_empty_range!(Location::new(5), Location::new(12)),
+            };
+            update_tx.send(next.clone()).await.unwrap();
+            let engine = Engine::new(config).await.unwrap();
+            let NextStep::Continue(engine) = engine.step().await.unwrap() else {
+                panic!("the coordinator has not requested completion");
+            };
+            assert_eq!(
+                reached_rx.try_recv().ok(),
+                Some(original),
+                "a queued update hid a reached target from the coordinator"
+            );
+            assert_eq!(engine.target, next);
+        });
+    }
 }

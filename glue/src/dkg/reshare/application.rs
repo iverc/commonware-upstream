@@ -1241,4 +1241,53 @@ mod tests {
             }
         });
     }
+
+    #[test]
+    fn verification_retries_pending_final_epoch_info() {
+        deterministic::Runner::default().start(|context| async move {
+            for matches in [true, false] {
+                let parent = Arc::new(mocks::genesis_block(leader().public_key()));
+                let payload = epoch_payload(1);
+                let tip = final_block(&parent, Some(payload.clone()));
+                let derived = if matches { payload } else { epoch_payload(2) };
+                let inner = RecordingApp::accepting();
+                let (sender, mut receiver) = mailbox::new::<
+                    Message<TestBlock, TestBlsVariant, PrivateKey>,
+                >(
+                    context.child("mailbox"), NZUsize!(1)
+                );
+                context.child("fake_actor").spawn(move |_| async move {
+                    for response in [
+                        EpochInfoResponse::Pending,
+                        EpochInfoResponse::Pending,
+                        EpochInfoResponse::Available(Some(derived)),
+                    ] {
+                        let Some(Message::EpochInfo {
+                            response: reply, ..
+                        }) = receiver.recv().await
+                        else {
+                            panic!("verification must retry the epoch-info request");
+                        };
+                        assert!(reply.send(response).is_ok());
+                    }
+                });
+                let mut app = Application::new(inner.clone(), Mailbox::new(sender), NZU64!(2));
+                let started = context.current();
+                commonware_macros::select! {
+                    verified = app.verify(
+                        (context.child("app"), block_context(&parent, 1)),
+                        ancestry::from_iter([tip, parent]),
+                    ) => assert_eq!(verified, matches),
+                    _ = context.sleep(Duration::from_secs(1)) => {
+                        panic!("verification remained stuck after epoch info became available");
+                    },
+                }
+                assert!(
+                    context.current().duration_since(started).unwrap()
+                        >= Duration::from_millis(200)
+                );
+                assert_eq!(inner.verify_count(), usize::from(matches));
+            }
+        });
+    }
 }
