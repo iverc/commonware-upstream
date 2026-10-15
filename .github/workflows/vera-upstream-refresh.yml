@@ -30,21 +30,16 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: commonware-focused-storage
-          cache-on-failure: 'false'
+          cache-on-failure: 'true'
       - uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
         with:
           tool: cargo-nextest@0.9.133
-      - name: Compile focused regressions
+      - name: Check sync, archive and DKG regressions
         run: >-
           cargo nextest run --locked -p commonware-storage -p commonware-glue
-          --no-run --ignore-default-filter
-          -E 'test(reports_reached_target_before_queued_update) | test(test_prune_cleans_lookup_index) | test(verification_retries_pending_final_epoch_info)'
-      - name: Reproduce upstream baseline failures
-        run: python3 .github/scripts/check-vera-upstream-baseline.py
-      - name: Upload baseline logs
-        if: always()
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
-        with:
-          name: vera-upstream-baseline
-          path: ${{ runner.temp }}/vera-upstream-baseline
-          if-no-files-found: ignore
+          --ignore-default-filter
+          -E '(test(qmdb::sync::engine::tests::) | test(archive::prunable::tests::) | test(dkg::reshare::application::tests::) | test(tuple_state_sync)) & not test(/_slow_(::|$)/)'
+      - name: Lint changed packages
+        run: cargo clippy --locked -p commonware-storage -p commonware-glue --all-targets -- -D warnings
+      - name: Check storage without default features
+        run: cargo check --locked -p commonware-storage --no-default-features

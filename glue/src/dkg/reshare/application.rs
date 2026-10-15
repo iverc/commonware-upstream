@@ -13,7 +13,9 @@ use commonware_cryptography::{Digested, Signer, bls12381::primitives::variant::V
 use commonware_runtime::{Clock, Metrics, Spawner, telemetry::traces::TracedExt as _};
 use commonware_utils::sequence::Unit;
 use rand_core::Rng;
-use std::{future, num::NonZeroU64};
+use std::{future, num::NonZeroU64, time::Duration};
+
+const EPOCH_INFO_RETRY_DELAY: Duration = Duration::from_millis(100);
 use tracing::{debug, field};
 
 /// Per-proposal input handed to an application wrapped by [`Application`].
@@ -34,9 +36,9 @@ pub struct Input<Upstream, V: Variant, C: Signer, D: Directory<C::PublicKey> = U
 ///
 /// At the final block, verification compares the block's payload with the
 /// independently derived one from [`Mailbox::epoch_info`]. It rejects a
-/// mismatch or [`EpochInfoResponse::Unavailable`]. On
-/// [`EpochInfoResponse::Pending`] or [`EpochInfoResponse::Following`] (for
-/// example, while the actor follows an epoch), it stays unresolved until
+/// mismatch or [`EpochInfoResponse::Unavailable`]. It retries
+/// [`EpochInfoResponse::Pending`] while the actor catches up. On
+/// [`EpochInfoResponse::Following`], verification stays unresolved until
 /// consensus cancels it. Before the final block, verification rejects a block
 /// that carries any payload except a dealer log from the midpoint onward.
 ///
@@ -284,26 +286,29 @@ where
         span.record("has_payload", tip_payload.is_some());
 
         if self.final_block(height) {
-            match self.reshare.epoch_info(ancestry.clone()).await {
-                EpochInfoResponse::Available(derived) => {
-                    if derived != tip_payload {
-                        debug!("verification rejected: final block payload mismatch");
+            loop {
+                match self.reshare.epoch_info(ancestry.clone()).await {
+                    EpochInfoResponse::Available(derived) => {
+                        if derived != tip_payload {
+                            debug!("verification rejected: final block payload mismatch");
+                            return false;
+                        }
+                        break;
+                    }
+                    EpochInfoResponse::Pending => {
+                        // Certification may outlive a transient gap in finalized DKG replay.
+                        // Yield before retrying so replay can advance without a mailbox busy loop.
+                        context.0.sleep(EPOCH_INFO_RETRY_DELAY).await;
+                    }
+                    EpochInfoResponse::Following => {
+                        debug!("verification pending: actor is following the epoch");
+                        future::pending::<()>().await;
+                        unreachable!("pending future must not resolve");
+                    }
+                    EpochInfoResponse::Unavailable => {
+                        debug!("verification rejected: final block epoch info is unavailable");
                         return false;
                     }
-                }
-                response @ (EpochInfoResponse::Pending | EpochInfoResponse::Following) => {
-                    // Neither response is a verdict, so verification stays
-                    // unresolved until consensus cancels it.
-                    debug!(
-                        following = matches!(response, EpochInfoResponse::Following),
-                        "verification pending: final block epoch info cannot be derived locally"
-                    );
-                    future::pending::<()>().await;
-                    unreachable!("pending future must not resolve");
-                }
-                EpochInfoResponse::Unavailable => {
-                    debug!("verification rejected: final block epoch info is unavailable");
-                    return false;
                 }
             }
         } else {
