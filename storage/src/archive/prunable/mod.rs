@@ -221,7 +221,7 @@ mod tests {
     use crate::{
         archive::{Archive as _, Error, Identifier, MultiArchive as _},
         journal::{Error as JournalError, segmented::glob::corrupt_frame},
-        translator::{EightCap, FourCap, TwoCap},
+        translator::{EightCap, FourCap, TwoCap, UintIdentity},
     };
     use commonware_codec::{Error as CodecError, FixedSize};
     use commonware_cryptography::Crc32;
@@ -239,6 +239,7 @@ mod tests {
     use rand::RngExt as _;
     use std::{
         collections::BTreeMap,
+        hash::{BuildHasher, Hasher},
         num::{NonZeroU16, NonZeroU64},
         sync::{
             Arc,
@@ -3001,15 +3002,6 @@ mod tests {
 
     #[test_traced]
     fn test_prune_visits_each_translated_bucket_once() {
-        use crate::translator::UintIdentity;
-        use std::{
-            hash::{BuildHasher, Hasher},
-            sync::{
-                Arc,
-                atomic::{AtomicUsize, Ordering},
-            },
-        };
-
         #[derive(Clone)]
         struct CountedTranslator(Arc<AtomicUsize>);
         struct CountedHasher(UintIdentity, Arc<AtomicUsize>);

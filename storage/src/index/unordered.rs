@@ -321,7 +321,8 @@ mod tests {
     fn retain_preserves_order_and_metrics_for_every_small_subset() {
         deterministic::Runner::default().start(|context| async move {
             for mask in 0u8..32 {
-                let mut index = Index::new(context.child(&format!("mask_{mask}")), FourCap);
+                let mut index =
+                    Index::new(context.child("mask").with_attribute("mask", mask), FourCap);
                 for value in 0..5 {
                     index.insert(b"same", value);
                 }
