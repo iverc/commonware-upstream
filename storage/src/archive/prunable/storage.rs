@@ -420,7 +420,8 @@ impl<T: Translator, E: Context, K: Array, V: CodecShared> Inner<T, E, K, V> {
                 continue;
             }
             previous_section = Some(section);
-            for position in 0..self.oversized.size(section)? {
+            let records = self.oversized.size(section)? / Record::<K>::SIZE as u64;
+            for position in 0..records {
                 let entry = self.oversized.get(section, position).await?;
                 self.keys.retain(entry.key.as_ref(), |index| *index >= min);
             }
