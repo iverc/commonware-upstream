@@ -75,6 +75,12 @@ impl<T: Translator, V: Send + Sync> Index<T, V> {
         }
     }
 
+    /// Returns the bucket key used for an untranslated key.
+    #[commonware_macros::stability(ALPHA)]
+    pub(crate) fn translate(&self, key: &[u8]) -> T::Key {
+        self.translator.transform(key)
+    }
+
     /// Create an empty index with this index's translator and metric handles. Parallel
     /// snapshot-build workers use it for their partition slots.
     #[commonware_macros::stability(ALPHA)]
@@ -250,6 +256,39 @@ impl<T: Translator, V: Send + Sync> Unordered for Index<T, V> {
                 }
             }
         }
+    }
+
+    fn retain(&mut self, key: &[u8], mut should_retain: impl FnMut(&V) -> bool) {
+        let k = self.translator.transform(key);
+        let Entry::Occupied(mut entry) = self.map.entry(k) else {
+            return;
+        };
+        let keep_head = should_retain(entry.get());
+        let mut removed = usize::from(!keep_head);
+        if let Some(chain) = self.overflow.get_mut(&k) {
+            let before = chain.len();
+            // Visit newest first, preserving predicate order and the surviving chain's order.
+            chain.reverse();
+            chain.retain(&mut should_retain);
+            chain.reverse();
+            removed += before - chain.len();
+            if !keep_head {
+                if let Some(head) = chain.pop() {
+                    *entry.get_mut() = head;
+                } else {
+                    entry.remove();
+                    self.keys.dec();
+                }
+            }
+            if chain.is_empty() {
+                self.overflow.remove(&k);
+            }
+        } else if !keep_head {
+            entry.remove();
+            self.keys.dec();
+        }
+        self.items.dec_by(removed as i64);
+        self.pruned.inc_by(removed as u64);
     }
 
     fn remove(&mut self, key: &[u8]) {

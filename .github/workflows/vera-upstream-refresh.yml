@@ -27,6 +27,7 @@ jobs:
         with:
           toolchain: 1.98.0
           components: clippy
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: commonware-focused-storage
@@ -34,11 +35,14 @@ jobs:
       - uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
         with:
           tool: cargo-nextest@0.9.133
-      - name: Reproduce archive and coordinator regressions
-        run: python3 .github/scripts/verify-review-regressions.py
-      - name: Preserve regression output
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: review-regression-baseline
-          path: review-regression-*.log
+      - name: Verify archive and sync corrections
+        run: >-
+          cargo nextest run --locked -p commonware-storage -p commonware-glue
+          --ignore-default-filter
+          -E 'test(index::) | test(archive::prunable::tests::) | test(stateful::db::tests::) | test(qmdb::sync::engine::tests::) | test(state_sync_drains_queued_target_before_reporting_reached)'
+      - name: Lint affected crates and tests
+        run: cargo clippy --locked -p commonware-storage -p commonware-glue --all-targets -- -D warnings
+      - name: Check storage without default features
+        run: cargo check --locked -p commonware-storage --no-default-features
+      - name: Check storage on WebAssembly
+        run: cargo check --locked -p commonware-storage --target wasm32-unknown-unknown

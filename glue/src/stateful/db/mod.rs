@@ -853,15 +853,23 @@ where
         let coordinator = async {
             let mut current_anchor = anchor;
             let mut tip_updates = Some(tip_updates);
+            let mut last_reached = None;
             loop {
                 if !drain_single_tip_updates(
                     &mut tip_updates,
                     &target_tx,
                     &mut current_anchor,
                     &mut current_target,
+                    &mut reached_rx,
+                    &mut last_reached,
                 )
                 .await
                 {
+                    return (current_anchor, current_target);
+                }
+
+                if last_reached.as_ref() == Some(&current_target) {
+                    let _ = finish_tx.send_lossy(()).await;
                     return (current_anchor, current_target);
                 }
 
@@ -874,21 +882,7 @@ where
                         let Some(reached) = reached else {
                             return (current_anchor, current_target);
                         };
-                        if !drain_single_tip_updates(
-                            &mut tip_updates,
-                            &target_tx,
-                            &mut current_anchor,
-                            &mut current_target,
-                        )
-                        .await
-                        {
-                            return (current_anchor, current_target);
-                        };
-                        if reached != current_target {
-                            continue;
-                        }
-                        let _ = finish_tx.send_lossy(()).await;
-                        return (current_anchor, current_target);
+                        last_reached = Some(reached);
                     },
                     update = update_future => {
                         let Some(update) = update else {
@@ -909,7 +903,7 @@ where
                         let Some(new_target) = target else {
                             continue;
                         };
-                        if !target_tx.send_lossy(new_target).await {
+                        if !send_single_target(&target_tx, new_target, &mut reached_rx, &mut last_reached).await {
                             return (current_anchor, current_target);
                         }
                     },
@@ -927,14 +921,36 @@ where
     }
 }
 
+/// Keep accepting progress while the database's target queue is full.
+async fn send_single_target<T: Send>(
+    target_tx: &mpsc::Sender<T>,
+    target: T,
+    reached_rx: &mut mpsc::Receiver<T>,
+    last_reached: &mut Option<T>,
+) -> bool {
+    let send = target_tx.send(target);
+    futures::pin_mut!(send);
+    loop {
+        select! {
+            sent = &mut send => return sent.is_ok(),
+            reached = reached_rx.recv() => {
+                let Some(reached) = reached else { return false; };
+                *last_reached = Some(reached);
+            },
+        }
+    }
+}
+
 /// Handles every queued tip update, then forwards the newest adopted targets if they changed.
 ///
-/// Returns `false` if the database stopped accepting targets.
+/// Returns `false` if the database closes its target or progress channel.
 async fn drain_single_tip_updates<D, T>(
     tip_updates: &mut Option<ring::Receiver<TipUpdate<D, T>>>,
     target_tx: &mpsc::Sender<T>,
     current_anchor: &mut Anchor<D>,
     current_target: &mut T,
+    reached_rx: &mut mpsc::Receiver<T>,
+    last_reached: &mut Option<T>,
 ) -> bool
 where
     D: Digest,
@@ -977,7 +993,7 @@ where
         return true;
     }
     *current_target = new_target.clone();
-    target_tx.send_lossy(new_target).await
+    send_single_target(target_tx, new_target, reached_rx, last_reached).await
 }
 
 macro_rules! impl_database_set {
@@ -1983,7 +1999,7 @@ mod tests {
         Anchor, AttachableResolver, AttachableResolverSet, Barrier, BatchContext,
         CoordinatorAction, CoordinatorState, DatabaseSet, InitError, MAX_CHANNEL_DRAIN_PER_TICK,
         ManagedDb, Shared, StateSyncDb, StateSyncSet, SyncEngineConfig, TipUpdate,
-        drain_single_tip_updates,
+        drain_single_tip_updates, send_single_target,
     };
     use crate::stateful::tests::mocks::{TestMerkleized, TestUnmerkleized, anchor as mock_anchor};
     use commonware_cryptography::sha256;
@@ -3959,6 +3975,8 @@ mod tests {
             let _ = tip_tx.send(newer_update).await;
             let _ = tip_tx.send(older_update).await;
 
+            let (_reached_tx, mut reached_rx) = mpsc::channel(1);
+            let mut last_reached = None;
             let mut tip_updates = Some(tip_rx);
             let mut current_anchor = anchor(0);
             let mut current_target = 0u64;
@@ -3968,6 +3986,8 @@ mod tests {
                     &target_tx,
                     &mut current_anchor,
                     &mut current_target,
+                    &mut reached_rx,
+                    &mut last_reached,
                 )
                 .await
             );
@@ -3997,6 +4017,8 @@ mod tests {
 
             let _ = tip_tx.send(update).await;
 
+            let (_reached_tx, mut reached_rx) = mpsc::channel(1);
+            let mut last_reached = None;
             let mut tip_updates = Some(tip_rx);
             let mut current_anchor = anchor(2);
             let mut current_target = 7u64;
@@ -4006,6 +4028,8 @@ mod tests {
                     &target_tx,
                     &mut current_anchor,
                     &mut current_target,
+                    &mut reached_rx,
+                    &mut last_reached,
                 )
                 .await
             );
@@ -4866,6 +4890,26 @@ mod tests {
 
             resolvers.attach_databases(databases).await;
             assert_eq!(&*log.lock(), &["db1", "db2"]);
+        });
+    }
+
+    #[test]
+    fn single_target_send_stops_when_either_channel_closes() {
+        deterministic::Runner::default().start(|_context| async move {
+            let (targets, mut target_rx) = mpsc::channel(1);
+            let (progress, mut reached_rx) = mpsc::channel(1);
+            targets.send(1u64).await.unwrap();
+            drop(progress);
+            let mut reached = None;
+            assert!(!send_single_target(&targets, 2, &mut reached_rx, &mut reached).await);
+            assert_eq!(target_rx.recv().await, Some(1));
+            assert!(target_rx.try_recv().is_err());
+            assert_eq!(reached, None);
+
+            let (_progress, mut reached_rx) = mpsc::channel(1);
+            drop(target_rx);
+            assert!(!send_single_target(&targets, 2, &mut reached_rx, &mut reached).await);
+            assert_eq!(reached, None);
         });
     }
 
